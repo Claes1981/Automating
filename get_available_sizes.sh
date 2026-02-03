@@ -1,71 +1,65 @@
 #!/usr/bin/env bash
-# Usage: ./vm-ubuntu-prices.sh northeurope
-# Requires: az, jq, curl
+# Usage: ./vm-prices-final.sh northeurope
+# Shows Linux VM prices (pay-as-you-go) for Ubuntu Server 24.04 LTS
 
 LOCATION="$1"
 if [ -z "$LOCATION" ]; then
-  echo "Usage: $0 <azure-region>  (e.g. northeurope, westeurope)" >&2
+  echo "Usage: $0 northeurope" >&2
   exit 1
 fi
 
-echo "Fetching VM SKUs for region: $LOCATION ..." >&2
+echo "Fetching VM SKUs for $LOCATION..." >&2
 VM_SKUS_JSON=$(az vm list-skus \
   --location "$LOCATION" \
   --resource-type virtualMachines \
   --all \
   -o json)
 
-# Name, armSkuName, vCPUs, MemoryGB, Tier
-VM_TABLE=$(echo "$VM_SKUS_JSON" | jq -r '
+# Extract VM table
+VM_TABLE=$(echo "$VM_SKUS_JSON" | jq -r "
   .[]
-  | select(.locations[]? == "'"$LOCATION"'")
+  | select(.locations[]? == \"$LOCATION\")
   | {
       name: .name,
-      armSkuName: .name,   # for VMs this usually matches armSkuName in pricing API
-      tier: .tier,
-      vcpus: (.capabilities[]? | select(.name=="vCPUs") | .value),
-      memoryGb: (.capabilities[]? | select(.name=="MemoryGB") | .value)
+      vcpus: (.capabilities[]? | select(.name==\"vCPUs\") | .value),
+      memoryGb: (.capabilities[]? | select(.name==\"MemoryGB\") | .value),
+      tier: .tier
     }
   | select(.vcpus != null and .memoryGb != null)
-  | "\(.name)\t\(.armSkuName)\t\(.vcpus)\t\(.memoryGb)\t\(.tier)"
-')
+  | \"\(.name)\t\(.vcpus)\t\(.memoryGb)\t\(.tier)\"
+")
 
-echo "Fetching retail prices for region: $LOCATION (all VM meters) ..." >&2
+# URL-encoded filter for northeurope VMs
+FILTER="serviceFamily eq 'Compute' and armRegionName eq '$LOCATION' and serviceName eq 'Virtual Machines'"
+ENCODED_FILTER=$(echo "$FILTER" | sed "s/'/%27/g")
 
-BASE_URL="https://prices.azure.com/api/retail/prices"
-# NOTE: we do NOT filter on osType here; we just take compute meters and ignore Windows-specific ones by name.
-FILTER="\$filter=serviceFamily eq 'Compute' and armRegionName eq '$LOCATION' and serviceName eq 'Virtual Machines'"
+CURL_URL="https://prices.azure.com/api/retail/prices?\$filter=${ENCODED_FILTER}&\$top=1000"
+echo "Fetching prices from: $CURL_URL" >&2
 
-PAGE_URL="${BASE_URL}?${FILTER}"
-PRICE_ITEMS="[]"
+PRICE_JSON=$(curl -s "$CURL_URL")
+PRICE_ITEMS=$(echo "$PRICE_JSON" | jq '.Items // []')
 
-# Simple pagination loop (Retail API is paged)
-while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ]; do
-  PAGE_JSON=$(curl -s "$PAGE_URL")
-  PRICE_ITEMS=$(jq -s '.[0] + .[1].Items' <(echo "$PRICE_ITEMS") <(echo "$PAGE_JSON"))
-  PAGE_URL=$(echo "$PAGE_JSON" | jq -r '.NextPageLink')
-done
-
-# Build a map: armSkuName -> hourly price
-# Prefer: type == "Consumption", no "Spot" / "Low Priority", and productName not containing "Windows".
+# CRITICAL: Fixed price map logic - prefer REGULAR Linux VMs (not Spot/Low Priority/Windows)
 PRICE_MAP=$(echo "$PRICE_ITEMS" | jq -r '
   .[]
-  | select(.unitPrice != null and .unitPrice > 0)
-  | select(.type == "Consumption")
-  | select((.skuName | contains("Spot") | not) and (.skuName | contains("Low Priority") | not))
-  | select(.productName | contains("Windows") | not)
+  | select(.armSkuName? != null and .armSkuName != "")
+  | select(.type == "Consumption")                    # Pay-as-you-go only
+  | select(.skuName? | contains("Spot") | not)         # Skip Spot VMs
+  | select(.skuName? | contains("Low Priority") | not) # Skip Low Priority  
+  | select(.productName? | contains("Windows") | not)  # Skip Windows VMs
+  | select(.meterName? | test("^[A-Za-z0-9_-]+$"))     # Linux compute meter (like "D2s_v5", "B2s")
   | "\(.armSkuName)\t\(.unitPrice)"
-')
+' | sort -u)
 
-echo -e "Name\tvCPUs\tRAM_GB\tTier\tHourly_USD\tMonthly_USD"
+echo -e "Name\tvCPUs\tRAM_GB\tTier\tHourly_USD\tMonthly_USD\n"
 
-echo "$VM_TABLE" | while IFS=$'\t' read -r NAME ARMSKU VCPUS MEM_GB TIER; do
-  HOURLY=$(echo "$PRICE_MAP" | awk -v sku="$ARMSKU" 'BEGIN{FS="\t"} $1==sku {print $2; exit}')
-  if [ -z "$HOURLY" ]; then
+echo "$VM_TABLE" | while IFS=$'\t' read -r NAME VCPUS RAM_GB TIER; do
+  HOURLY=$(echo "$PRICE_MAP" | awk -v sku="$NAME" 'BEGIN{FS="\t"} $1==sku {print $2; exit}')
+  if [ -z "$HOURLY" ] || [ "$HOURLY" = "null" ] || [ "$HOURLY" = "0" ]; then
     HOURLY="N/A"
     MONTHLY="N/A"
   else
-    MONTHLY=$(awk -v h="$HOURLY" 'BEGIN { printf "%.2f", h*730 }')
+    MONTHLY=$(awk "BEGIN { printf \"%.2f\", $HOURLY*730 }")
   fi
-  echo -e "$NAME\t$VCPUS\t$MEM_GB\t$TIER\t$HOURLY\t$MONTHLY"
-done
+  echo -e "$NAME\t$VCPUS\t$RAM_GB\t$TIER\t$HOURLY\t$MONTHLY"
+done | head -30  # First 30 results
