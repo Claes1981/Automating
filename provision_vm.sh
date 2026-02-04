@@ -3,7 +3,7 @@
 # Variables
 resource_group="MyOneClickGroup"
 vm_name="MyOneClickVM"
-location="westeurope"
+location="northeurope"
 custom_data_file="custom_data_nginx.sh"
 
 # Create a resource group
@@ -17,7 +17,8 @@ az vm create \
    --location $location \
    --name $vm_name \
    --image Ubuntu2404 \
-   --size F1als_v7 \
+   --size Standard_F1als_v7 \
+   --zone 3 \
    --admin-username azureuser \
    --generate-ssh-keys \
    --custom-data @$custom_data_file
