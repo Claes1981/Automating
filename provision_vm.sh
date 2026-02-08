@@ -4,6 +4,8 @@ set -euo pipefail
 RESOURCE_GROUP="MyOneClickGroup"
 VM_NAME="MyOneClickVM"
 LOCATION="northeurope"
+ZONE="3"
+VM_SIZE="Standard_F1als_v7"
 CUSTOM_DATA_FILE="custom_data_nginx.sh"
 function log_error() {
     echo "ERROR: $1" >&2
@@ -22,8 +24,8 @@ function create_vm() {
         --location "$LOCATION" \
         --name "$VM_NAME" \
         --image Ubuntu2404 \
-        --size Standard_F1als_v7 \
-        --zone 3 \
+        --size "$VM_SIZE" \
+        --zone "$ZONE" \
         --admin-username azureuser \
         --generate-ssh-keys \
         --custom-data "@$CUSTOM_DATA_FILE"; then
