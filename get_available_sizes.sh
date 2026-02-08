@@ -1,71 +1,116 @@
 #!/usr/bin/env bash
 # Usage: ./get_available_sizes.sh northeurope
 
+# Constants
+TIMEOUT_SECONDS=600
+CURL_TIMEOUT_SECONDS=60
+MAX_RESULTS=30
+
+# Validate input
 LOCATION="$1"
 if [ -z "$LOCATION" ]; then
-  echo "Usage: $0 northeurope" >&2
+  echo "Usage: $0 <location>" >&2
+  echo "Example: $0 northeurope" >&2
   exit 1
 fi
 
-echo "Fetching VM SKUs for $LOCATION..." >&2
-VM_SKUS_JSON=$(timeout 300 az vm list-skus \
-  --location "$LOCATION" \
-  --resource-type virtualMachines \
-  --all \
-  -o json)
-
-VM_TABLE=$(echo "$VM_SKUS_JSON" | jq -r "
-  .[]
-  | select(.locations[]? == \"$LOCATION\")
-  | {
-      name: .name,
-      vcpus: (.capabilities[]? | select(.name==\"vCPUs\") | .value),
-      memoryGb: (.capabilities[]? | select(.name==\"MemoryGB\") | .value)
-    }
-  | select(.vcpus != null and .memoryGb != null)
-  | \"\(.name)\t\(.vcpus)\t\(.memoryGb)\"
-")
-
-# Fixed URL encoding + fetch
-FILTER="serviceFamily eq 'Compute' and armRegionName eq '$LOCATION' and serviceName eq 'Virtual Machines'"
-ENCODED_FILTER=$(echo "$FILTER" | sed "s/'/%27/g")
-CURL_URL="https://prices.azure.com/api/retail/prices?$filter=${ENCODED_FILTER}&$top=1000"
-
-echo "Fetching prices..." >&2
-PRICE_JSON=$(timeout 300 curl -s --max-time 60 "$CURL_URL")
-
-# DEBUG: Show what we're working with
-echo "$PRICE_JSON" | jq -r '.Items[] | select(.armRegionName == "'$LOCATION'") | "\(.armSkuName)\t\(.unitPrice)\t\(.productName)"' | head -5 >&2
-
-# Check if we got valid JSON
-if ! echo "$PRICE_JSON" | jq -e '.Items' >/dev/null 2>&1; then
-  echo "ERROR: Failed to fetch price data or invalid response" >&2
-  exit 1
-fi
-
-# SIMPLIFIED filter: ANY Consumption VM in region (we'll clean up later)
-PRICE_MAP=$(echo "$PRICE_JSON" | jq -r '
-  .Items[]
-  | select(.armRegionName == "'$LOCATION'")
-  | select(.type == "Consumption")
-  | select(.armSkuName? != null and .armSkuName != "")
-  | select(.armSkuName | startswith("Standard_"))
-  | "\(.armSkuName)\t\(.unitPrice)"
-' | sort -u)
-
-echo -e "Name\tvCPUs\tRAM_GB\tHourly_USD\tMonthly_USD (730h)\n"
-
-echo "$VM_TABLE" | while IFS=$'\t' read -r NAME VCPUS RAM_GB; do
-  # Match VM name to armSkuName (strip "Standard_" prefix if needed)
-  MATCH_SKU=$(echo "$NAME" | sed 's/^Standard_//')
-  HOURLY=$(echo "$PRICE_MAP" | awk -v sku="$NAME" -v msku="$MATCH_SKU" 'BEGIN{FS="\t"} 
-    ($1==sku || $1==("Standard_" msku)) {print $2; exit}')
+# Fetch VM SKUs
+fetch_vm_skus() {
+  local location="$1"
+  echo "Fetching VM SKUs for $location..." >&2
   
-  if [ -z "$HOURLY" ] || [ "$HOURLY" = "null" ]; then
-    HOURLY="N/A"
-    MONTHLY="N/A"
-  else
-    MONTHLY=$(awk "BEGIN { printf \"%.2f\", $HOURLY*730 }")
+  VM_SKUS_JSON=$(timeout "$TIMEOUT_SECONDS" az vm list-skus \
+    --location "$location" \
+    --resource-type virtualMachines \
+    --all \
+    -o json 2>&1)
+  
+  if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to fetch VM SKUs" >&2
+    echo "$VM_SKUS_JSON" >&2
+    exit 1
   fi
-  echo -e "$NAME\t$VCPUS\t$RAM_GB\t$HOURLY\t$MONTHLY"
-done | head -30
+  
+  echo "$VM_SKUS_JSON" | jq -r "
+    .[]
+    | select(.locations[]? == \"$location\")
+    | {
+        name: .name,
+        vcpus: (.capabilities[]? | select(.name==\"vCPUs\") | .value),
+        memoryGb: (.capabilities[]? | select(.name==\"MemoryGB\") | .value)
+      }
+    | select(.vcpus != null and .memoryGb != null)
+    | \"\\t\\t\\t\\t\"
+  "
+}
+
+# Fetch pricing data
+fetch_pricing_data() {
+  local location="$1"
+  echo "Fetching prices..." >&2
+  
+  # Build filter and URL
+  local filter="serviceFamily eq 'Compute' and armRegionName eq '$location' and serviceName eq 'Virtual Machines'"
+  local encoded_filter=$(echo "$filter" | sed "s/'/%27/g")
+  local curl_url="https://prices.azure.com/api/retail/prices?\$filter=${encoded_filter}&\$top=1000"
+  
+  PRICE_JSON=$(timeout "$TIMEOUT_SECONDS" curl -s --max-time "$CURL_TIMEOUT_SECONDS" "$curl_url" 2>&1)
+  
+  if [ $? -ne 0 ]; then
+    echo "WARNING: Failed to fetch price data" >&2
+    return 1
+  fi
+  
+  # Validate JSON response
+  if ! echo "$PRICE_JSON" | jq -e '.Items' >/dev/null 2>&1; then
+    echo "WARNING: Invalid price data response" >&2
+    return 1
+  fi
+  
+  # Extract price map
+  echo "$PRICE_JSON" | jq -r '
+    .Items[]
+    | select(.armRegionName == "'$location'")
+    | select(.type == "Consumption")
+    | select(.armSkuName? != null and .armSkuName != "")
+    | select(.armSkuName | startswith("Standard_"))
+    | "\(.armSkuName)\t\(.unitPrice)"
+  ' | sort -u
+}
+
+# Display results
+display_results() {
+  local vm_table="$1"
+  local price_map="$2"
+  
+  echo -e "Name\tvCPUs\tRAM_GB\tHourly_USD\tMonthly_USD (730h)\n"
+  
+  echo "$vm_table" | while IFS=$'\t' read -r NAME VCPUS RAM_GB; do
+    # Match VM name to armSkuName
+    local match_sku=$(echo "$NAME" | sed 's/^Standard_//')
+    local hourly
+    
+    if [ -n "$price_map" ]; then
+      hourly=$(echo "$price_map" | awk -v sku="$NAME" -v msku="$match_sku" 'BEGIN{FS="\t"} 
+        ($1==sku || $1==("Standard_" msku)) {print $2; exit}')
+    fi
+    
+    if [ -z "$hourly" ] || [ "$hourly" = "null" ]; then
+      hourly="N/A"
+      monthly="N/A"
+    else
+      monthly=$(awk "BEGIN { printf \"%.2f\", $hourly*730 }")
+    fi
+    
+    echo -e "$NAME\t$VCPUS\t$RAM_GB\t$hourly\t$monthly"
+  done | head -"$MAX_RESULTS"
+}
+
+# Main execution
+main() {
+  VM_TABLE=$(fetch_vm_skus "$LOCATION")
+  PRICE_MAP=$(fetch_pricing_data "$LOCATION" 2>&1)
+  display_results "$VM_TABLE" "$PRICE_MAP"
+}
+
+main
