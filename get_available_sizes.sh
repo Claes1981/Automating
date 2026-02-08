@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: ./vm-prices-working.sh northeurope
+# Usage: ./get_available_sizes.sh northeurope
 
 LOCATION="$1"
 if [ -z "$LOCATION" ]; then
