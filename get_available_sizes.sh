@@ -8,7 +8,7 @@ if [ -z "$LOCATION" ]; then
 fi
 
 echo "Fetching VM SKUs for $LOCATION..." >&2
-VM_SKUS_JSON=$(az vm list-skus \
+VM_SKUS_JSON=$(timeout 300 az vm list-skus \
   --location "$LOCATION" \
   --resource-type virtualMachines \
   --all \
@@ -29,13 +29,19 @@ VM_TABLE=$(echo "$VM_SKUS_JSON" | jq -r "
 # Fixed URL encoding + fetch
 FILTER="serviceFamily eq 'Compute' and armRegionName eq '$LOCATION' and serviceName eq 'Virtual Machines'"
 ENCODED_FILTER=$(echo "$FILTER" | sed "s/'/%27/g")
-CURL_URL="https://prices.azure.com/api/retail/prices?\$filter=${ENCODED_FILTER}&\$top=1000"
+CURL_URL="https://prices.azure.com/api/retail/prices?$filter=${ENCODED_FILTER}&$top=1000"
 
 echo "Fetching prices..." >&2
-PRICE_JSON=$(curl -s "$CURL_URL")
+PRICE_JSON=$(timeout 300 curl -s --max-time 60 "$CURL_URL")
 
 # DEBUG: Show what we're working with
-echo "$PRICE_JSON" | jq -r '.Items[] | select(.armRegionName == "'$LOCATION'") | "\(.armSkuName)\t\(.meterName)\t\(.unitPrice)\t\(.productName)"' | head -5 >&2
+echo "$PRICE_JSON" | jq -r '.Items[] | select(.armRegionName == "'$LOCATION'") | "\(.armSkuName)\t\(.unitPrice)\t\(.productName)"' | head -5 >&2
+
+# Check if we got valid JSON
+if ! echo "$PRICE_JSON" | jq -e '.Items' >/dev/null 2>&1; then
+  echo "ERROR: Failed to fetch price data or invalid response" >&2
+  exit 1
+fi
 
 # SIMPLIFIED filter: ANY Consumption VM in region (we'll clean up later)
 PRICE_MAP=$(echo "$PRICE_JSON" | jq -r '
