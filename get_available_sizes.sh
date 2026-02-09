@@ -40,7 +40,7 @@ fetch_vm_skus() {
         memoryGb: (.capabilities[]? | select(.name==\"MemoryGB\") | .value)
       }
     | select(.vcpus != null and .memoryGb != null)
-    | \"\\t\\t\\t\\t\"
+    | [.name, .vcpus, .memoryGb] | @tsv
   "
 }
 
