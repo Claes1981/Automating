@@ -52,7 +52,7 @@ fetch_pricing_data() {
   # Build filter and URL
   local filter="serviceFamily eq 'Compute' and armRegionName eq '$location' and serviceName eq 'Virtual Machines'"
   local encoded_filter=$(echo "$filter" | sed "s/'/%27/g")
-  local curl_url="https://prices.azure.com/api/retail/prices?\$filter=${encoded_filter}&\$top=1000"
+  local curl_url="https://prices.azure.com/api/retail/prices?filter=${encoded_filter}&top=1000"
   
   PRICE_JSON=$(timeout "$TIMEOUT_SECONDS" curl -s --max-time "$CURL_TIMEOUT_SECONDS" "$curl_url" 2>&1)
   
