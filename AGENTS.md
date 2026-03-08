@@ -1,10 +1,10 @@
 # AGENTS.md
 
-This file contains guidelines for agentic coding agents operating in this repository.
+Guidelines for agentic coding agents operating in this repository.
 
 ## Repository Overview
 
-Azure VM automation scripts for provisioning, pricing lookup, and cleanup:
+Azure VM automation scripts:
 - `provision_vm.sh`: Creates Azure VM with nginx, supports CLI arguments
 - `get_available_sizes.sh`: Fetches VM sizes and pricing from Azure APIs
 - `custom_data_nginx.sh`: User data script for VM boot (installs nginx)
@@ -12,30 +12,18 @@ Azure VM automation scripts for provisioning, pricing lookup, and cleanup:
 
 ## Build/Lint/Test Commands
 
-### Lint Commands
+### Lint
 ```bash
 bash -n script.sh                    # Check syntax
 shellcheck script.sh                 # Best practices (if available)
-shellcheck -x script.sh              # With shellcheck exemptions
 ```
 
-### Test Commands
+### Test
 ```bash
 bash -x script.sh                    # Debug execution
 DEBUG=true ./script.sh               # Enable debug logging
 ./script.sh --help                   # Show usage
-```
-
-### Test Specific Script
-```bash
-# Test provision_vm.sh (dry-run)
-./provision_vm.sh --help
-
-# Test get_available_sizes.sh
 ./get_available_sizes.sh northeurope | head -20
-
-# Test delete_resource_group.sh
-./delete_resource_group.sh --help
 ```
 
 ## Shell Script Guidelines
@@ -53,15 +41,13 @@ set -euo pipefail
 
 log_info() { echo "$*"; }
 log_error() { echo "ERROR: $*" >&2; }
-log_warning() { echo "WARNING: $*" >&2; }
+log_debug() { [[ "${DEBUG:-}" == "true" ]] && echo "DEBUG: $*" >&2; }
 
-# Check command status
 if ! command; then
   log_error "Failed to execute command"
   return 1
 fi
 
-# Trap for cleanup
 cleanup() { rm -f "${TEMP_FILES[@]}" 2>/dev/null; }
 trap cleanup EXIT
 ```
@@ -73,17 +59,10 @@ trap cleanup EXIT
 - Array for temp files: `declare -a TEMP_FILES=()`
 
 ### Functions
-- Name: `snake_case` with descriptive verbs (`create_resource_group`)
-- Parameters: Use `local` for all function variables
-- Return: Exit codes (0 success, non-zero failure)
+- Name: `snake_case` with descriptive verbs
+- Use `local` for all function variables
+- Return exit codes (0 success, non-zero failure)
 - Single responsibility: One task per function
-
-### Logging Pattern
-```bash
-log_info() { echo "$*"; }
-log_error() { echo "ERROR: $*" >&2; }
-log_debug() { [[ "${DEBUG:-}" == "true" ]] && echo "DEBUG: $*" >&2; }
-```
 
 ## Code Style
 
@@ -106,11 +85,9 @@ log_debug() { [[ "${DEBUG:-}" == "true" ]] && echo "DEBUG: $*" >&2; }
 - Use environment variables for sensitive data
 - Validate all user input
 - Set permissions: `chmod 755 script.sh`
-- Check dependencies before execution
 
 ## Azure CLI Usage
 
-### Best Practices
 ```bash
 # Check Azure login
 if ! az account show &> /dev/null; then
@@ -143,14 +120,6 @@ jq -r --arg loc "$location" '
 ' file.json
 ```
 
-### Text with awk
-```bash
-awk -F '\t' -v price_file="$file" '
-  BEGIN { while ((getline < price_file) > 0) price[$1] = $2 }
-  { print $1, ($1 in price ? price[$1] : "N/A") }
-' input.txt
-```
-
 ### Temp Files
 ```bash
 create_temp_file() {
@@ -164,17 +133,10 @@ create_temp_file() {
 
 ### Before Committing
 ```bash
-# 1. Check syntax
-bash -n *.sh
-
-# 2. Run ShellCheck (if available)
-shellcheck *.sh
-
-# 3. Test with --help
-./script.sh --help
-
-# 4. Review changes
-git diff
+bash -n *.sh           # Check syntax
+shellcheck *.sh        # Run ShellCheck
+./script.sh --help     # Test usage
+git diff               # Review changes
 ```
 
 ### Debugging
@@ -188,7 +150,6 @@ set -x; command; set +x        # Targeted debug
 - Use temporary resource groups
 - Test in non-production subscriptions
 - Always verify cleanup works
-- Check API rate limits
 
 ## Common Patterns
 
@@ -212,30 +173,4 @@ check_dependencies() {
     command -v "$dep" &> /dev/null || { log_error "$dep required"; exit 1; }
   done
 }
-```
-
-### Well-Structured Script Template
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly CONSTANT="value"
-
-usage() { cat >&2 <<EOF
-Usage: $SCRIPT_NAME [OPTIONS]
-...
-EOF
-}
-
-log_info() { echo "$*"; }
-log_error() { echo "ERROR: $*" >&2; }
-
-main() {
-  parse_arguments "$@"
-  check_dependencies
-  # Logic here
-}
-
-main "$@"
 ```
