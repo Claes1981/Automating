@@ -4,158 +4,238 @@ This file contains guidelines for agentic coding agents operating in this reposi
 
 ## Repository Overview
 
-This repository contains shell scripts for Azure VM provisioning and management:
-- `provision_vm.sh`: Creates Azure VM with custom data and opens port 80
-- `get_available_sizes.sh`: Fetches VM sizes and pricing for a location
-- `custom_data_nginx.sh`: User data script that installs nginx on VM boot
-- `delete_resource_group.sh`: Cleans up Azure resource group
+Azure VM automation scripts for provisioning, pricing lookup, and cleanup:
+- `provision_vm.sh`: Creates Azure VM with nginx, supports CLI arguments
+- `get_available_sizes.sh`: Fetches VM sizes and pricing from Azure APIs
+- `custom_data_nginx.sh`: User data script for VM boot (installs nginx)
+- `delete_resource_group.sh`: Safely deletes resource groups with confirmation
 
 ## Build/Lint/Test Commands
 
 ### Lint Commands
-- `bash -n script.sh` - Check script syntax without executing
-- `shellcheck script.sh` - Run ShellCheck for best practices (if available)
+```bash
+bash -n script.sh                    # Check syntax
+shellcheck script.sh                 # Best practices (if available)
+shellcheck -x script.sh              # With shellcheck exemptions
+```
 
 ### Test Commands
-- `bash -x script.sh` - Execute script with debug output
-- `./test_pricing.sh` - Test Azure pricing API connectivity
-- Run scripts in dry-run mode first (add `--dry-run` flags where supported)
+```bash
+bash -x script.sh                    # Debug execution
+DEBUG=true ./script.sh               # Enable debug logging
+./script.sh --help                   # Show usage
+```
+
+### Test Specific Script
+```bash
+# Test provision_vm.sh (dry-run)
+./provision_vm.sh --help
+
+# Test get_available_sizes.sh
+./get_available_sizes.sh northeurope | head -20
+
+# Test delete_resource_group.sh
+./delete_resource_group.sh --help
+```
 
 ## Shell Script Guidelines
 
 ### Script Structure
-- Always start with `#!/usr/bin/env bash` for portability
-- Include usage statement or help message for scripts with parameters
-- Use consistent 4-space indentation
-- Separate logical sections with comments
+- Shebang: `#!/usr/bin/env bash` (portable)
+- Error handling: `set -euo pipefail` (line 2)
+- Header comment block with script purpose
+- `readonly` for constants, `local` for function variables
+- Call `main "$@"` at script end
 
 ### Error Handling
-- Use `set -euo pipefail` at the top of every script
-- Check command exit status: `if ! command; then ...` or `command || exit 1`
-- Redirect errors to stderr: `echo "ERROR: $1" >&2`
-- Create reusable `log_error()` function for consistent error handling
+```bash
+set -euo pipefail
+
+log_info() { echo "$*"; }
+log_error() { echo "ERROR: $*" >&2; }
+log_warning() { echo "WARNING: $*" >&2; }
+
+# Check command status
+if ! command; then
+  log_error "Failed to execute command"
+  return 1
+fi
+
+# Trap for cleanup
+cleanup() { rm -f "${TEMP_FILES[@]}" 2>/dev/null; }
+trap cleanup EXIT
+```
 
 ### Variable Usage
-- Uppercase for constants: `RESOURCE_GROUP="MyGroup"`
-- Lowercase with underscores for local variables: `local vm_ip=""`
-- Always quote variable expansions: `"$VAR"` not `$VAR`
-- Use `local` for function-scoped variables
+- Constants: `readonly VARIABLE_NAME="value"` (UPPER_SNAKE_CASE)
+- Local variables: `local variable_name=""` (snake_case)
+- Always quote: `"$VAR"` never `$VAR`
+- Array for temp files: `declare -a TEMP_FILES=()`
 
 ### Functions
-- Use functions to encapsulate reusable logic
-- Return exit codes (0 for success, non-zero for failure)
-- Document function purpose in comments
-- Call `main` function at the end of scripts
+- Name: `snake_case` with descriptive verbs (`create_resource_group`)
+- Parameters: Use `local` for all function variables
+- Return: Exit codes (0 success, non-zero failure)
+- Single responsibility: One task per function
 
-### Azure CLI Usage
-- Use `az` commands with proper resource group and location parameters
-- Use `--query` and `-o` flags for structured output
-- Handle JSON output with `jq` for complex parsing
-- Example: `az vm show -g "$RG" -n "$VM" --query publicIps -o tsv`
-
-### Text Processing
-- Use `jq` for JSON manipulation
-- Use `awk` for column-based text processing
-- Use `sed` for simple substitutions
-- Use `sort -u` for deduplication
+### Logging Pattern
+```bash
+log_info() { echo "$*"; }
+log_error() { echo "ERROR: $*" >&2; }
+log_debug() { [[ "${DEBUG:-}" == "true" ]] && echo "DEBUG: $*" >&2; }
+```
 
 ## Code Style
 
 ### Naming Conventions
-- Variables: `snake_case` for local, `UPPER_SNAKE_CASE` for constants
-- Functions: `snake_case` with descriptive names
-- Descriptive names over abbreviations
+| Element | Convention | Example |
+|---------|------------|---------|
+| Constants | `UPPER_SNAKE_CASE` | `readonly DEFAULT_LOCATION="northeurope"` |
+| Variables | `snake_case` | `local vm_ip=""` |
+| Functions | `snake_case` | `create_resource_group()` |
+| Files | `snake_case.sh` | `provision_vm.sh` |
 
 ### Comments
-- Document script purpose, usage, and parameters in header
-- Comment non-obvious logic
-- Use `>&2` for debug/error messages to stderr
+- Header: Script purpose, usage, examples
+- Functions: Brief description of purpose
+- Complex logic: Explain why, not what
+- Use `>&2` for stderr output
 
 ### Security
-- Never commit secrets or credentials
+- Never hardcode secrets or credentials
 - Use environment variables for sensitive data
 - Validate all user input
-- Use secure permissions: `chmod 755 script.sh`
+- Set permissions: `chmod 755 script.sh`
+- Check dependencies before execution
+
+## Azure CLI Usage
+
+### Best Practices
+```bash
+# Check Azure login
+if ! az account show &> /dev/null; then
+  log_error "Not logged in to Azure"
+  exit 1
+fi
+
+# Use --query for structured output
+az vm show -g "$RG" -n "$VM" --query publicIps -o tsv
+
+# Handle JSON with jq
+az vm list-skus ... -o json | jq -r '.[].name'
+
+# Use timeouts for long operations
+timeout 600 az vm list-skus --all
+```
+
+### Resource Management
+- Always specify `--resource-group` and `--location`
+- Use `--no-wait` for async operations
+- Check resource existence before operations
+- Clean up temp files with `trap`
+
+## Text Processing
+
+### JSON with jq
+```bash
+jq -r --arg loc "$location" '
+  .[] | select(.locations[]? == $loc) | .name
+' file.json
+```
+
+### Text with awk
+```bash
+awk -F '\t' -v price_file="$file" '
+  BEGIN { while ((getline < price_file) > 0) price[$1] = $2 }
+  { print $1, ($1 in price ? price[$1] : "N/A") }
+' input.txt
+```
+
+### Temp Files
+```bash
+create_temp_file() {
+  local temp_file=$(mktemp "/tmp/${1}_XXXXXX")
+  TEMP_FILES+=("$temp_file")
+  echo "$temp_file"
+}
+```
 
 ## Development Workflow
 
-### Git Commands
-- `git status` - Check working tree status
-- `git diff` - Review changes before committing
-- `git log` - Review commit history
-- Follow conventional commit messages
+### Before Committing
+```bash
+# 1. Check syntax
+bash -n *.sh
+
+# 2. Run ShellCheck (if available)
+shellcheck *.sh
+
+# 3. Test with --help
+./script.sh --help
+
+# 4. Review changes
+git diff
+```
 
 ### Debugging
-- `bash -x script.sh` - Full debug trace
-- `set -x` / `set +x` - Targeted debug sections
-- Add `echo` statements for variable inspection
-- Use `strace` for system call tracing
+```bash
+bash -x script.sh              # Full trace
+DEBUG=true ./script.sh         # Debug logging
+set -x; command; set +x        # Targeted debug
+```
 
-### Testing
-- Test in non-production environments first
-- Use temporary resource groups for Azure testing
-- Validate output with sample data
-- Always test cleanup procedures
+### Testing Azure Scripts
+- Use temporary resource groups
+- Test in non-production subscriptions
+- Always verify cleanup works
+- Check API rate limits
 
-## Troubleshooting
+## Common Patterns
 
-### Common Issues
-- **Permission denied**: Run `chmod +x script.sh`
-- **Command not found**: Check PATH or use full paths
-- **JSON parsing errors**: Validate with `jq .`
-- **Azure CLI errors**: Run `az login` and `az account show`
+### Argument Parsing
+```bash
+parse_arguments() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -g|--resource-group) RESOURCE_GROUP="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) log_error "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+}
+```
 
-### Azure Commands
-- `az login --use-device-code` - Authenticate interactively
-- `az account show` - Verify current subscription
-- `az vm list` - List existing VMs
-- `az group delete --name RG --yes --no-wait` - Delete resource group
+### Dependency Check
+```bash
+check_dependencies() {
+  for dep in jq curl az; do
+    command -v "$dep" &> /dev/null || { log_error "$dep required"; exit 1; }
+  done
+}
+```
 
-## Examples
-
-### Well-Structured Script
+### Well-Structured Script Template
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Constants
-RESOURCE_GROUP="MyGroup"
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly CONSTANT="value"
 
-# Functions
-log_error() {
-    echo "ERROR: $1" >&2
-    exit 1
+usage() { cat >&2 <<EOF
+Usage: $SCRIPT_NAME [OPTIONS]
+...
+EOF
 }
 
-create_resource_group() {
-    if ! az group create --name "$RESOURCE_GROUP" --location "$LOCATION"; then
-        log_error "Failed to create resource group"
-    fi
-}
+log_info() { echo "$*"; }
+log_error() { echo "ERROR: $*" >&2; }
 
 main() {
-    create_resource_group
+  parse_arguments "$@"
+  check_dependencies
+  # Logic here
 }
 
-main
+main "$@"
 ```
-
-### Bad Practices to Avoid
-```bash
-#!/bin/bash
-# Missing error handling, unquoted variables
-
-az group create --name $resource_group --location westus
-```
-
-## Contributing
-
-### Code Reviews
-- Check error handling completeness
-- Validate Azure resource naming conventions
-- Ensure proper documentation
-
-### Pull Requests
-- Include description of changes
-- Provide testing instructions
-- Document breaking changes
