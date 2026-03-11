@@ -11,7 +11,7 @@ set -euo pipefail
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly AZURE_CLI_TIMEOUT=600
 readonly API_TIMEOUT=60
-readonly MAX_API_PAGES=250
+readonly MAX_API_PAGES=500
 readonly HOURS_PER_MONTH=730
 readonly PRICING_API_BASE="https://prices.azure.com/api/retail/prices"
 readonly VM_RESOURCE_TYPE="virtualMachines"
