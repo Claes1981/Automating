@@ -18,6 +18,27 @@ readonly VM_RESOURCE_TYPE="virtualMachines"
 readonly SERVICE_NAME="Virtual Machines"
 readonly PRICING_TYPE="Consumption"
 
+declare -a EUROPEAN_REGIONS=(
+  "northeurope"
+  "westeurope"
+  "centralus"
+  "ukwest"
+  "uksouth"
+  "germanywestcentral"
+  "germanynortheast"
+  "francecentral"
+  "francesouth"
+  "italynorth"
+  "switzerlandnorth"
+  "switzerlandwest"
+  "netherlandsnorth"
+  "spaincentral"
+  "spaineast"
+  "swedencentral"
+  "sweden south"
+  "polandcentral"
+)
+
 declare -a TEMP_FILES=()
 
 ################################################################################
@@ -102,10 +123,14 @@ parse_arguments() {
   local -n _location_ref=$1
   local -n _image_filter_ref=$2
   local -n _include_future_ref=$3
+  local -n _europe_ref=$4
   
   _location_ref=""
   _image_filter_ref=""
   _include_future_ref=false
+  _europe_ref=false
+  
+  shift 4
   
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -115,6 +140,10 @@ parse_arguments() {
         ;;
       --include-future)
         _include_future_ref=true
+        shift
+        ;;
+      --europe)
+        _europe_ref=true
         shift
         ;;
       -h|--help)
@@ -137,8 +166,9 @@ parse_arguments() {
 show_usage() {
   cat >&2 <<EOF
 Usage: $SCRIPT_NAME <location> [OPTIONS]
+       $SCRIPT_NAME --europe [OPTIONS]
 
-Displays available Azure VM sizes with pricing for the specified region.
+Displays available Azure VM sizes with pricing for the specified region or all European regions.
 
 Arguments:
   location    Azure region (e.g., northeurope, eastus, westeurope)
@@ -146,24 +176,53 @@ Arguments:
 Options:
   -i, --image IMAGE      Filter VMs by OS image (e.g., Ubuntu2404, WindowsServer)
   --include-future       Include prices with future effectiveStartDate
+  --europe               Fetch VMs across all European Azure regions
   -h, --help             Show this help message
+
+European regions included:
+  northeurope, westeurope, ukwest, uksouth, francecentral, francesouth,
+  italynorth, netherlandsnorth, spaincentral, spaineast, swedencentral,
+  polandcentral, switzerlandnorth, switzerlandwest
 
 Examples:
   $SCRIPT_NAME northeurope
-  $SCRIPT_NAME northeurope --image Ubuntu2404
-  $SCRIPT_NAME eastus --image Ubuntu2404 --include-future
+  $SCRIPT_NAME --europe --image Ubuntu2404
+  $SCRIPT_NAME --europe --include-future
 EOF
 }
 
 validate_arguments() {
   local location="$1"
+  local europe="$2"
   
-  if [[ -z "$location" ]]; then
-    log_error "Location is required"
+  if [[ -z "$location" && "$europe" != "true" ]]; then
+    log_error "Location is required or use --europe flag"
     show_usage
     return 1
   fi
   
+  if [[ -n "$location" && "$europe" == "true" ]]; then
+    log_error "Cannot specify both location and --europe flag"
+    show_usage
+    return 1
+  fi
+  
+  return 0
+}
+
+get_european_regions() {
+  local output_file="$1"
+  
+  log_info "Fetching available European regions from Azure CLI..."
+  
+  if ! timeout "$AZURE_CLI_TIMEOUT" az account list-locations \
+      -o json > "$output_file" 2>&1; then
+    log_error "Failed to fetch Azure locations"
+    cat "$output_file" >&2
+    return 1
+  fi
+  
+  jq -r '.[] | select(.name | startswith("europe") or startswith("uk") or startswith("germany") or startswith("france") or startswith("italy") or startswith("netherlands") or startswith("spain") or startswith("sweden") or startswith("poland") or startswith("switzerland") or startswith("austria") or startswith("belgium") or endswith("europe")) | .name' "$output_file" | sort -u
   return 0
 }
 
@@ -200,7 +259,7 @@ parse_vm_skus_to_table() {
   
   jq -r --arg loc "$location" '
     .[]
-    | select(.locations[]? == $loc)
+    | select(.locations[]? | ascii_downcase == ($loc | ascii_downcase))
     | .name as $sku
     | (.capabilities // []) as $caps
     | ($caps | map(select(.name == "vCPUs")) | .[0].value // "0") as $vcpus
@@ -579,19 +638,17 @@ display_vm_table() {
 # Main orchestration
 ################################################################################
 main() {
-  local location image_filter include_future
+  local location image_filter include_future europe
   
-  parse_arguments location image_filter include_future "$@"
+  parse_arguments location image_filter include_future europe "$@"
   
-  if ! validate_arguments "$location"; then
+  if ! validate_arguments "$location" "$europe"; then
     exit 1
   fi
   
   if ! check_dependencies; then
     exit 1
   fi
-  
-  log_info "Starting VM pricing lookup for region: $location"
   
   if [[ -n "$image_filter" ]]; then
     log_info "Filtering by image: $image_filter"
@@ -607,12 +664,18 @@ main() {
   vm_table_file=$(create_temp_file "vm_table")
   pricing_file=$(create_temp_file "pricing")
   
-  if ! fetch_vm_data "$location" "$vm_table_file" "$image_filter"; then
-    exit 1
-  fi
-  
-  if ! fetch_pricing_data "$location" "$pricing_file" "$include_future"; then
-    exit 1
+  if [[ "$europe" == "true" ]]; then
+    process_european_regions "$vm_table_file" "$pricing_file" "$image_filter" "$include_future"
+  else
+    log_info "Starting VM pricing lookup for region: $location"
+    
+    if ! fetch_vm_data "$location" "$vm_table_file" "$image_filter"; then
+      exit 1
+    fi
+    
+    if ! fetch_pricing_data "$location" "$pricing_file" "$include_future"; then
+      exit 1
+    fi
   fi
   
   local price_count
@@ -620,6 +683,63 @@ main() {
   log_info "Found pricing data for $price_count VM SKUs"
   
   display_vm_table "$vm_table_file" "$pricing_file"
+}
+
+process_european_regions() {
+  local vm_table_file="$1"
+  local pricing_file="$2"
+  local image_filter="$3"
+  local include_future="$4"
+  
+  local regions_file locations_file
+  locations_file=$(create_temp_file "locations")
+  regions_file=$(create_temp_file "regions")
+  
+  if ! get_european_regions "$locations_file" > "$regions_file"; then
+    log_error "Failed to fetch European regions"
+    return 1
+  fi
+  
+  local region_count
+  region_count=$(wc -l < "$regions_file")
+  log_info "Found $region_count European regions to process"
+  
+  local combined_vm_file
+  combined_vm_file=$(create_temp_file "combined_vm")
+  touch "$combined_vm_file"
+  
+  while IFS= read -r region; do
+    log_info "Processing region: $region"
+    
+    local region_vm_file
+    region_vm_file=$(create_temp_file "region_vm")
+    
+    if ! fetch_vm_data "$region" "$region_vm_file" "$image_filter"; then
+      log_debug "Skipping region $region due to VM data fetch failure"
+      continue
+    fi
+    
+    cat "$region_vm_file" >> "$combined_vm_file"
+    
+    local vm_count
+    vm_count=$(count_lines "$region_vm_file")
+    log_debug "  $region: $vm_count VMs"
+  done < "$regions_file"
+  
+  sort -u "$combined_vm_file" -o "$vm_table_file"
+  
+  log_info "Fetching pricing data for all European regions (single API call)..."
+  if ! fetch_pricing_data "" "$pricing_file" "$include_future"; then
+    log_error "Failed to fetch pricing data"
+    return 1
+  fi
+  
+  local total_vms total_pricing
+  total_vms=$(count_lines "$vm_table_file")
+  total_pricing=$(count_lines "$pricing_file")
+  log_info "Total across all European regions: $total_vms unique VMs, $total_pricing pricing entries"
+  
+  return 0
 }
 
 main "$@"
