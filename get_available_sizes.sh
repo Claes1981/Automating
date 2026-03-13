@@ -553,7 +553,15 @@ fetch_pricing_data() {
   
   log_info "Fetching pricing data from Azure Pricing API..."
   
-  local next_page="$PRICING_API_BASE"
+  local base_url="$PRICING_API_BASE"
+  local filter_query=""
+  
+  if [[ -n "$location" ]]; then
+    filter_query="&$filter=armRegionName%20eq%20'$location'"
+    log_info "Using server-side filter for region: $location"
+  fi
+  
+  local next_page="${base_url}${filter_query}"
   local page_count=0
   local total_items=0
   
@@ -582,7 +590,7 @@ fetch_pricing_data() {
       return 1
     fi
     
-    extract_pricing_data "$page_response" "$location" "$today" "$include_future" "$output_file"
+    extract_pricing_data "$page_response" "" "$today" "$include_future" "$output_file"
     
     local page_items
     page_items=$(count_page_items "$page_response")
@@ -593,6 +601,11 @@ fetch_pricing_data() {
     log_debug "Page $page_count: $page_items items, cumulative matches: $matched_count"
     
     next_page=$(get_next_page_link "$page_response")
+    
+    if [[ -n "$filter_query" && -z "$next_page" ]]; then
+      log_debug "No more pages with server-side filter"
+      break
+    fi
   done
   
   log_info "Fetched pricing for $total_items items across $page_count pages"
