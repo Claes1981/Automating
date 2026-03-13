@@ -13,30 +13,29 @@ readonly AZURE_CLI_TIMEOUT=600
 readonly API_TIMEOUT=60
 readonly MAX_API_PAGES=500
 readonly HOURS_PER_MONTH=730
-readonly PRICING_API_BASE="https://prices.azure.com/api/retail/prices"
+readonly PRICING_API_BASE="https://prices.azure.com/api/retail/prices?api-version=2022-08-01"
 readonly VM_RESOURCE_TYPE="virtualMachines"
 readonly SERVICE_NAME="Virtual Machines"
 readonly PRICING_TYPE="Consumption"
 
 declare -a EUROPEAN_REGIONS=(
-  "northeurope"
-  "westeurope"
-  "centralus"
-  "ukwest"
-  "uksouth"
-  "germanywestcentral"
-  "germanynortheast"
+  "austriaeast"
+  "belgiumcentral"
   "francecentral"
   "francesouth"
+  "germanynorth"
+  "germanywestcentral"
   "italynorth"
+  "northeurope"
+  "netherlandsnorth"
+  "polandcentral"
+  "spaincentral"
+  "swedencentral"
   "switzerlandnorth"
   "switzerlandwest"
-  "netherlandsnorth"
-  "spaincentral"
-  "spaineast"
-  "swedencentral"
-  "sweden south"
-  "polandcentral"
+  "uksouth"
+  "ukwest"
+  "westeurope"
 )
 
 declare -a TEMP_FILES=()
@@ -222,7 +221,17 @@ get_european_regions() {
     return 1
   fi
   
-  jq -r '.[] | select(.name | startswith("europe") or startswith("uk") or startswith("germany") or startswith("france") or startswith("italy") or startswith("netherlands") or startswith("spain") or startswith("sweden") or startswith("poland") or startswith("switzerland") or startswith("austria") or startswith("belgium") or endswith("europe")) | .name' "$output_file" | sort -u
+  local available_regions
+  available_regions=$(jq -r '.[].name' "$output_file" | tr '[:upper:]' '[:lower:]')
+  
+  local -a valid_regions=()
+  for region in "${EUROPEAN_REGIONS[@]}"; do
+    if echo "$available_regions" | grep -qx "$region"; then
+      valid_regions+=("$region")
+    fi
+  done
+  
+  printf '%s\n' "${valid_regions[@]}" | sort -u
   return 0
 }
 
@@ -492,11 +501,18 @@ extract_pricing_data() {
   local include_future="$4"
   local output_file="$5"
   
+  local region_filter
+  if [[ -n "$location" ]]; then
+    region_filter=".armRegionName? == \"$location\""
+  else
+    region_filter="true"
+  fi
+  
   local jq_filter
   if [[ "$include_future" == "true" ]]; then
     jq_filter="
       .Items[]
-      | select(.armRegionName? == \"$location\")
+      | select($region_filter)
       | select(.serviceName? == \"$SERVICE_NAME\")
       | select(.armSkuName? != null and .armSkuName != \"\")
       | select(.type == \"$PRICING_TYPE\")
@@ -505,7 +521,7 @@ extract_pricing_data() {
   else
     jq_filter="
       .Items[]
-      | select(.armRegionName? == \"$location\")
+      | select($region_filter)
       | select(.serviceName? == \"$SERVICE_NAME\")
       | select(.armSkuName? != null and .armSkuName != \"\")
       | select(.type == \"$PRICING_TYPE\")
