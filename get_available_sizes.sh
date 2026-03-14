@@ -18,6 +18,30 @@ readonly VM_RESOURCE_TYPE="virtualMachines"
 readonly SERVICE_NAME="Virtual Machines"
 readonly PRICING_TYPE="Consumption"
 
+declare -A REGION_PROXIMITY=(
+  ["swedencentral"]=1
+  ["swedensouth"]=2
+  ["northeurope"]=3
+  ["norwayeast"]=4
+  ["norwaywest"]=5
+  ["denmarkeast"]=6
+  ["germanynorth"]=7
+  ["polandcentral"]=8
+  ["finlandcentral"]=9
+  ["germanywestcentral"]=10
+  ["italynorth"]=11
+  ["francecentral"]=12
+  ["francesouth"]=13
+  ["belgiumcentral"]=14
+  ["westeurope"]=15
+  ["uksouth"]=16
+  ["ukwest"]=17
+  ["austriaeast"]=18
+  ["spaincentral"]=19
+  ["switzerlandnorth"]=20
+  ["switzerlandwest"]=21
+)
+
 declare -a EUROPEAN_REGIONS=(
   "austriaeast"
   "belgiumcentral"
@@ -283,6 +307,26 @@ parse_vm_skus_to_table() {
 count_lines() {
   local file="$1"
   wc -l < "$file"
+}
+
+get_closest_region_to_sweden() {
+  local vm_name="$1"
+  local vm_regions_file="$2"
+  
+  local best_region=""
+  local best_priority=999
+  
+  while IFS=$'\t' read -r name region; do
+    if [[ "$name" == "$vm_name" ]]; then
+      local priority="${REGION_PROXIMITY[$region]:-999}"
+      if [[ $priority -lt $best_priority ]]; then
+        best_priority=$priority
+        best_region="$region"
+      fi
+    fi
+  done < "$vm_regions_file"
+  
+  echo "$best_region"
 }
 
 ################################################################################
@@ -557,7 +601,7 @@ fetch_pricing_data() {
   local filter_query=""
   
   if [[ -n "$location" ]]; then
-    filter_query="&$filter=armRegionName%20eq%20'$location'"
+    filter_query="&filter=armRegionName%20eq%20'$location'"
     log_info "Using server-side filter for region: $location"
   fi
   
@@ -573,7 +617,7 @@ fetch_pricing_data() {
   
   while [[ -n "$next_page" && "$next_page" != "null" && page_count -lt MAX_API_PAGES ]]; do
     page_count=$((page_count + 1))
-    log_debug "Fetching page $page_count..."
+    log_info "Fetching pricing page $page_count..."
     
     local page_response
     page_response=$(create_temp_file "page_response")
@@ -619,8 +663,15 @@ fetch_pricing_data() {
 # Display functions
 ################################################################################
 print_table_header() {
-  printf "%-30s %6s %8s %12s %15s\n" "Name" "vCPUs" "RAM_GB" "Hourly_USD" "Monthly_USD"
-  printf "%-30s %6s %8s %12s %15s\n" "----" "------" "------" "----------" "------------"
+  local show_region="${1:-false}"
+  
+  if [[ "$show_region" == "true" ]]; then
+    printf "%-30s %6s %8s %12s %15s %20s\n" "Name" "vCPUs" "RAM_GB" "Hourly_USD" "Monthly_USD" "Region"
+    printf "%-30s %6s %8s %12s %15s %20s\n" "----" "------" "------" "----------" "------------" "--------"
+  else
+    printf "%-30s %6s %8s %12s %15s\n" "Name" "vCPUs" "RAM_GB" "Hourly_USD" "Monthly_USD"
+    printf "%-30s %6s %8s %12s %15s\n" "----" "------" "------" "----------" "------------"
+  fi
 }
 
 load_pricing_into_memory() {
@@ -638,12 +689,49 @@ load_pricing_into_memory() {
 format_vm_table_row() {
   local vm_data_file="$1"
   local pricing_data_file="$2"
+  local vm_regions_file="$3"
+  local show_region="$4"
   
-  awk -F '\t' -v price_file="$pricing_data_file" -v hours="$HOURS_PER_MONTH" '
+  if [[ -z "$vm_regions_file" || ! -f "$vm_regions_file" ]]; then
+    vm_regions_file="/dev/null"
+  fi
+  
+  awk -F '\t' -v price_file="$pricing_data_file" -v regions_file="$vm_regions_file" -v hours="$HOURS_PER_MONTH" -v show_region="$show_region" '
     BEGIN {
       while ((getline < price_file) > 0) {
         split($0, parts, "\t")
         price[parts[1]] = parts[2]
+      }
+      proximity["swedencentral"] = 1
+      proximity["swedensouth"] = 2
+      proximity["northeurope"] = 3
+      proximity["norwayeast"] = 4
+      proximity["norwaywest"] = 5
+      proximity["denmarkeast"] = 6
+      proximity["germanynorth"] = 7
+      proximity["polandcentral"] = 8
+      proximity["finlandcentral"] = 9
+      proximity["germanywestcentral"] = 10
+      proximity["italynorth"] = 11
+      proximity["francecentral"] = 12
+      proximity["francesouth"] = 13
+      proximity["belgiumcentral"] = 14
+      proximity["westeurope"] = 15
+      proximity["uksouth"] = 16
+      proximity["ukwest"] = 17
+      proximity["austriaeast"] = 18
+      proximity["spaincentral"] = 19
+      proximity["switzerlandnorth"] = 20
+      proximity["switzerlandwest"] = 21
+      while ((getline < regions_file) > 0) {
+        split($0, parts, "\t")
+        vm = parts[1]
+        region = parts[2]
+        prio = (region in proximity) ? proximity[region] : 999
+        if (!(vm in best_priority) || prio < best_priority[vm]) {
+          best_priority[vm] = prio
+          best_region[vm] = region
+        }
       }
     }
     {
@@ -652,8 +740,13 @@ format_vm_table_row() {
       ram = $3
       hourly = (name in price) ? price[name] : "N/A"
       monthly = (hourly != "N/A") ? sprintf("%.2f", hourly * hours) : "N/A"
+      region = (name in best_region) ? best_region[name] : "N/A"
       sort_key = (hourly != "N/A") ? hourly : 999999
-      printf "%010.6f\t%-30s\t%6s\t%8s\t%12s\t%15s\n", sort_key, name, vcpus, ram, hourly, monthly
+      if (show_region == "true") {
+        printf "%010.6f\t%-30s\t%6s\t%8s\t%12s\t%15s\t%-20s\n", sort_key, name, vcpus, ram, hourly, monthly, region
+      } else {
+        printf "%010.6f\t%-30s\t%6s\t%8s\t%12s\t%15s\n", sort_key, name, vcpus, ram, hourly, monthly
+      }
     }
   ' "$vm_data_file" | sort -t $'\t' -k1,1n | cut -f2-
 }
@@ -661,9 +754,11 @@ format_vm_table_row() {
 display_vm_table() {
   local vm_data_file="$1"
   local pricing_data_file="$2"
+  local vm_regions_file="$3"
+  local europe="$4"
   
-  print_table_header
-  format_vm_table_row "$vm_data_file" "$pricing_data_file"
+  print_table_header "$europe"
+  format_vm_table_row "$vm_data_file" "$pricing_data_file" "$vm_regions_file" "$europe"
 }
 
 ################################################################################
@@ -692,12 +787,13 @@ main() {
     log_info "Only showing current prices (effectiveStartDate <= today)"
   fi
   
-  local vm_table_file pricing_file
+  local vm_table_file pricing_file vm_regions_file
   vm_table_file=$(create_temp_file "vm_table")
   pricing_file=$(create_temp_file "pricing")
+  vm_regions_file=""
   
   if [[ "$europe" == "true" ]]; then
-    process_european_regions "$vm_table_file" "$pricing_file" "$image_filter" "$include_future"
+    vm_regions_file=$(process_european_regions "$vm_table_file" "$pricing_file" "$image_filter" "$include_future")
   else
     log_info "Starting VM pricing lookup for region: $location"
     
@@ -714,7 +810,7 @@ main() {
   price_count=$(count_lines "$pricing_file")
   log_info "Found pricing data for $price_count VM SKUs"
   
-  display_vm_table "$vm_table_file" "$pricing_file"
+  display_vm_table "$vm_table_file" "$pricing_file" "$vm_regions_file" "$europe"
 }
 
 process_european_regions() {
@@ -736,9 +832,11 @@ process_european_regions() {
   region_count=$(wc -l < "$regions_file")
   log_info "Found $region_count European regions to process"
   
-  local combined_vm_file
+  local combined_vm_file vm_regions_file
   combined_vm_file=$(create_temp_file "combined_vm")
+  vm_regions_file=$(create_temp_file "vm_regions")
   touch "$combined_vm_file"
+  touch "$vm_regions_file"
   
   while IFS= read -r region; do
     log_info "Processing region: $region"
@@ -753,12 +851,17 @@ process_european_regions() {
     
     cat "$region_vm_file" >> "$combined_vm_file"
     
+    while IFS=$'\t' read -r vm_name _; do
+      echo "${vm_name}	${region}" >> "$vm_regions_file"
+    done < "$region_vm_file"
+    
     local vm_count
     vm_count=$(count_lines "$region_vm_file")
     log_debug "  $region: $vm_count VMs"
   done < "$regions_file"
   
   sort -u "$combined_vm_file" -o "$vm_table_file"
+  sort -u "$vm_regions_file" -o "$vm_regions_file"
   
   log_info "Fetching pricing data for all European regions (single API call)..."
   if ! fetch_pricing_data "" "$pricing_file" "$include_future"; then
@@ -771,6 +874,7 @@ process_european_regions() {
   total_pricing=$(count_lines "$pricing_file")
   log_info "Total across all European regions: $total_vms unique VMs, $total_pricing pricing entries"
   
+  echo "$vm_regions_file"
   return 0
 }
 
