@@ -17,6 +17,7 @@ readonly PRICING_API_BASE="https://prices.azure.com/api/retail/prices?api-versio
 readonly VM_RESOURCE_TYPE="virtualMachines"
 readonly SERVICE_NAME="Virtual Machines"
 readonly PRICING_TYPE="Consumption"
+readonly PARALLEL_JOBS=6
 
 declare -A REGION_PROXIMITY=(
   ["swedencentral"]=1
@@ -96,13 +97,22 @@ log_debug() {
   fi
 }
 
+wait_for_background_jobs() {
+  local -n _pids=$1
+  
+  for pid in "${_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  _pids=()
+}
+
 ################################################################################
 # Cleanup handler
 ################################################################################
 cleanup() {
   log_debug "Cleaning up ${#TEMP_FILES[@]} temporary files..."
   for file in "${TEMP_FILES[@]}"; do
-    rm -f "$file" 2>/dev/null || true
+    rm -rf "$file" 2>/dev/null || true
   done
 }
 
@@ -283,6 +293,23 @@ fetch_vm_skus_raw() {
   return 0
 }
 
+fetch_vm_skus_all_regions() {
+  local output_file="$1"
+  
+  log_info "Fetching all VM SKUs globally from Azure CLI..."
+  
+  if ! timeout 300 az vm list-skus \
+      --resource-type "$VM_RESOURCE_TYPE" \
+      -o json > "$output_file" 2>&1; then
+    log_error "Failed to fetch VM SKUs from Azure CLI"
+    cat "$output_file" >&2
+    return 1
+  fi
+  
+  log_info "Fetched global VM SKUs successfully"
+  return 0
+}
+
 count_vm_skus() {
   local json_file="$1"
   jq 'length' < "$json_file"
@@ -302,6 +329,32 @@ parse_vm_skus_to_table() {
     | ($caps | map(select(.name == "MemoryGB")) | .[0].value // "0") as $ram
     | "\($sku)\t\($vcpus)\t\($ram)"
   ' "$json_file" > "$output_file"
+}
+
+parse_vm_skus_european_regions() {
+  local json_file="$1"
+  local regions_file="$2"
+  local output_file="$3"
+  local vm_regions_output="$4"
+  
+  local regions_json
+  regions_json=$(jq -R -s 'split("\n") | map(select(length > 0))' < "$regions_file")
+  
+  jq -r --argjson regions "$regions_json" '
+    ($regions | map(ascii_downcase)) as $regions_lower
+    | .[]
+    | .name as $sku
+    | .locations // [] as $locs
+    | ($locs | map(select((. | ascii_downcase) as $loc_lower | $regions_lower | index($loc_lower)))) as $europe_locs
+    | select(($europe_locs | length) > 0)
+    | (.capabilities // []) as $caps
+    | ($caps | map(select(.name == "vCPUs")) | .[0].value // "0") as $vcpus
+    | ($caps | map(select(.name == "MemoryGB")) | .[0].value // "0") as $ram
+    | $europe_locs[] as $loc
+    | "\($sku)\t\($vcpus)\t\($ram)\t\($loc)"
+  ' "$json_file" > "$vm_regions_output"
+  
+  cut -f1-3 "$vm_regions_output" | sort -u > "$output_file"
 }
 
 count_lines() {
@@ -440,6 +493,48 @@ filter_vms_by_architecture() {
   fi
 }
 
+get_image_architecture() {
+  local image_info_file="$1"
+  jq -r '.properties.architecture // "x64"' < "$image_info_file"
+}
+
+get_european_regions_with_image() {
+  local publisher="$1"
+  local offer="$2"
+  local sku="$3"
+  local regions_file="$4"
+  local output_file="$5"
+  
+  log_info "Checking which European regions support $publisher/$offer:$sku..."
+  
+  > "$output_file"
+  
+  while IFS= read -r region; do
+    local test_file
+    test_file=$(create_temp_file "image_test")
+    
+    if timeout 30 az vm image list \
+        --publisher "$publisher" \
+        --offer "$offer" \
+        --sku "$sku" \
+        --location "$region" \
+        -o json > "$test_file" 2>/dev/null; then
+      
+      local has_versions
+      has_versions=$(jq 'length' < "$test_file")
+      if [[ "$has_versions" -gt 0 ]]; then
+        echo "$region" >> "$output_file"
+      fi
+    fi
+    
+    rm -f "$test_file"
+  done < "$regions_file"
+  
+  local supported_count
+  supported_count=$(wc -l < "$output_file")
+  log_info "Image supported in $supported_count European regions"
+}
+
 apply_image_filter() {
   local location="$1"
   local image_filter="$2"
@@ -547,37 +642,42 @@ extract_pricing_data() {
   local today="$3"
   local include_future="$4"
   local output_file="$5"
+  local europe_regions_file="${6:-}"
+  local vm_table_file="${7:-}"
   
-  local region_filter
+  local jq_args=()
+  local jq_filter=""
+  
+  jq_args+=("--arg" "svc" "$SERVICE_NAME")
+  jq_args+=("--arg" "ptype" "$PRICING_TYPE")
+  
   if [[ -n "$location" ]]; then
-    region_filter=".armRegionName? == \"$location\""
+    jq_args+=("--arg" "loc" "$location")
+    jq_filter='.Items[] | select(.serviceName? == $svc) | select(.type == $ptype) | select(.armSkuName? != null and .armSkuName != "") | select(.armRegionName? == $loc)'
+  elif [[ -n "$europe_regions_file" && -f "$europe_regions_file" ]]; then
+    local regions_json
+    regions_json=$(jq -R -s 'split("\n") | map(select(length > 0))' < "$europe_regions_file")
+    jq_args+=("--argjson" "regions" "$regions_json")
+    jq_filter='.Items[] | select(.serviceName? == $svc) | select(.type == $ptype) | select(.armSkuName? != null and .armSkuName != "") | select(.armRegionName as $r | $regions | index($r))'
   else
-    region_filter="true"
+    jq_filter='.Items[] | select(.serviceName? == $svc) | select(.type == $ptype) | select(.armSkuName? != null and .armSkuName != "")'
   fi
   
-  local jq_filter
-  if [[ "$include_future" == "true" ]]; then
-    jq_filter="
-      .Items[]
-      | select($region_filter)
-      | select(.serviceName? == \"$SERVICE_NAME\")
-      | select(.armSkuName? != null and .armSkuName != \"\")
-      | select(.type == \"$PRICING_TYPE\")
-      | [.armSkuName, (.unitPrice | tonumber)] | @tsv
-    "
-  else
-    jq_filter="
-      .Items[]
-      | select($region_filter)
-      | select(.serviceName? == \"$SERVICE_NAME\")
-      | select(.armSkuName? != null and .armSkuName != \"\")
-      | select(.type == \"$PRICING_TYPE\")
-      | select(.effectiveStartDate? == null or .effectiveStartDate <= \"$today\")
-      | [.armSkuName, (.unitPrice | tonumber)] | @tsv
-    "
+  if [[ -n "$vm_table_file" && -f "$vm_table_file" ]]; then
+    local vms_json
+    vms_json=$(cut -f1 "$vm_table_file" | sort -u | jq -R -s 'split("\n") | map(select(length > 0))')
+    jq_args+=("--argjson" "vms" "$vms_json")
+    jq_filter="$jq_filter | select(.armSkuName as \$s | \$vms | index(\$s))"
   fi
   
-  jq -r "$jq_filter" "$response_file" >> "$output_file"
+  if [[ "$include_future" != "true" ]]; then
+    jq_args+=("--arg" "today" "$today")
+    jq_filter="$jq_filter | select(.effectiveStartDate? == null or .effectiveStartDate <= \$today)"
+  fi
+  
+  jq_filter="$jq_filter | \"\(.armSkuName)\t\(.unitPrice)\""
+  
+  jq -r "${jq_args[@]}" "$jq_filter" "$response_file" >> "$output_file"
 }
 
 get_next_page_link() {
@@ -594,6 +694,8 @@ fetch_pricing_data() {
   local location="$1"
   local output_file="$2"
   local include_future="${3:-false}"
+  local europe_regions_file="${4:-}"
+  local vm_table_file="${5:-}"
   
   log_info "Fetching pricing data from Azure Pricing API..."
   
@@ -603,6 +705,12 @@ fetch_pricing_data() {
   if [[ -n "$location" ]]; then
     filter_query="&filter=armRegionName%20eq%20'$location'"
     log_info "Using server-side filter for region: $location"
+  elif [[ -n "$europe_regions_file" && -f "$europe_regions_file" ]]; then
+    filter_query="&filter=serviceName%20eq%20%27Virtual%20Machines%27%20and%20type%20eq%20%27Consumption%27"
+    log_info "Using server-side filter for Virtual Machines Consumption"
+    if [[ -n "$vm_table_file" && -f "$vm_table_file" ]]; then
+      log_info "Will filter pricing by found VM SKUs ($total_vms VMs)"
+    fi
   fi
   
   local next_page="${base_url}${filter_query}"
@@ -617,24 +725,30 @@ fetch_pricing_data() {
   
   while [[ -n "$next_page" && "$next_page" != "null" && page_count -lt MAX_API_PAGES ]]; do
     page_count=$((page_count + 1))
-    log_info "Fetching pricing page $page_count..."
+    
+    # Show progress every 10 pages
+    if [[ $((page_count % 10)) -eq 1 ]]; then
+      log_info "Fetching pricing page $page_count..."
+    fi
     
     local page_response
     page_response=$(create_temp_file "page_response")
     
-    if ! fetch_pricing_page "$next_page" "$page_response"; then
-      log_error "Failed to fetch pricing page $page_count"
-      log_debug "Response: $(head -c 500 "$page_response")"
-      return 1
-    fi
+if ! fetch_pricing_page "$next_page" "$page_response"; then
+       log_debug "Failed to fetch pricing page $page_count, skipping..."
+       log_debug "Response: $(head -c 500 "$page_response")"
+       next_page=$(get_next_page_link "$page_response" 2>/dev/null) || next_page=""
+       continue
+     fi
     
-    if ! validate_pricing_response "$page_response"; then
-      log_error "Invalid response from Pricing API on page $page_count"
-      log_debug "Response: $(head -c 500 "$page_response")"
-      return 1
-    fi
+if ! validate_pricing_response "$page_response"; then
+       log_debug "Invalid response from Pricing API on page $page_count, skipping..."
+       log_debug "Response: $(head -c 500 "$page_response")"
+       next_page=$(get_next_page_link "$page_response")
+       continue
+     fi
     
-    extract_pricing_data "$page_response" "" "$today" "$include_future" "$output_file"
+    extract_pricing_data "$page_response" "" "$today" "$include_future" "$output_file" "$europe_regions_file" "$vm_table_file"
     
     local page_items
     page_items=$(count_page_items "$page_response")
@@ -652,7 +766,7 @@ fetch_pricing_data() {
     fi
   done
   
-  log_info "Fetched pricing for $total_items items across $page_count pages"
+  log_info "Fetched $page_count pricing pages ($total_items total items)"
   
   sort -u "$output_file" -o "$output_file"
   
@@ -813,15 +927,42 @@ main() {
   display_vm_table "$vm_table_file" "$pricing_file" "$vm_regions_file" "$europe"
 }
 
+process_region_parallel() {
+  local region="$1"
+  local output_dir="$2"
+  local image_filter="$3"
+  local region_vm_file region_regions_file
+  
+  region_vm_file="${output_dir}/vm_${region}.txt"
+  region_regions_file="${output_dir}/regions_${region}.txt"
+  
+  log_info "Processing region: $region"
+  
+  if ! fetch_vm_data "$region" "$region_vm_file" "$image_filter"; then
+    log_error "Failed to fetch VM SKUs for $region"
+    return 1
+  fi
+  
+  local vm_count
+  vm_count=$(count_lines "$region_vm_file")
+  log_info "Found $vm_count VM SKUs in $region"
+  
+  awk -F '\t' -v region="$region" '{print $1 "\t" region}' "$region_vm_file" > "$region_regions_file"
+  
+  return 0
+}
+
 process_european_regions() {
   local vm_table_file="$1"
   local pricing_file="$2"
   local image_filter="$3"
   local include_future="$4"
   
-  local regions_file locations_file
+  local regions_file locations_file output_dir
   locations_file=$(create_temp_file "locations")
   regions_file=$(create_temp_file "regions")
+  output_dir=$(mktemp -d "/tmp/europe_processing_XXXXXX")
+  TEMP_FILES+=("$output_dir")
   
   if ! get_european_regions "$locations_file" > "$regions_file"; then
     log_error "Failed to fetch European regions"
@@ -832,49 +973,51 @@ process_european_regions() {
   region_count=$(wc -l < "$regions_file")
   log_info "Found $region_count European regions to process"
   
-  local combined_vm_file vm_regions_file
-  combined_vm_file=$(create_temp_file "combined_vm")
-  vm_regions_file=$(create_temp_file "vm_regions")
-  touch "$combined_vm_file"
-  touch "$vm_regions_file"
+  log_info "Fetching VM SKUs for all European regions (parallel processing)..."
   
+  local pids=() region_list=()
   while IFS= read -r region; do
-    log_info "Processing region: $region"
-    
-    local region_vm_file
-    region_vm_file=$(create_temp_file "region_vm")
-    
-    if ! fetch_vm_data "$region" "$region_vm_file" "$image_filter"; then
-      log_debug "Skipping region $region due to VM data fetch failure"
-      continue
-    fi
-    
-    cat "$region_vm_file" >> "$combined_vm_file"
-    
-    while IFS=$'\t' read -r vm_name _; do
-      echo "${vm_name}	${region}" >> "$vm_regions_file"
-    done < "$region_vm_file"
-    
-    local vm_count
-    vm_count=$(count_lines "$region_vm_file")
-    log_debug "  $region: $vm_count VMs"
+    region_list+=("$region")
   done < "$regions_file"
   
-  sort -u "$combined_vm_file" -o "$vm_table_file"
-  sort -u "$vm_regions_file" -o "$vm_regions_file"
+  local batch_size=0
+  for region in "${region_list[@]}"; do
+    process_region_parallel "$region" "$output_dir" "$image_filter" &
+    pids+=($!)
+    ((batch_size++))
+    
+    if [[ $batch_size -ge $PARALLEL_JOBS ]]; then
+      wait "${pids[@]}" || true
+      pids=()
+      batch_size=0
+    fi
+  done
   
-  log_info "Fetching pricing data for all European regions (single API call)..."
-  if ! fetch_pricing_data "" "$pricing_file" "$include_future"; then
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    wait "${pids[@]}" || true
+  fi
+  
+  log_info "Consolidating VM data from all regions..."
+  
+  cat "$output_dir"/vm_*.txt 2>/dev/null | sort -u > "$vm_table_file" || true
+  cat "$output_dir"/regions_*.txt 2>/dev/null > "${vm_table_file}.regions" || true
+  
+  local total_vms total_regions
+  total_vms=$(count_lines "$vm_table_file")
+  total_regions=$(cut -f2 "${vm_table_file}.regions" | sort -u | wc -l)
+  log_info "Found $total_vms unique VMs across $total_regions European regions"
+  
+  log_info "Fetching pricing data for found VM SKUs..."
+  if ! fetch_pricing_data "" "$pricing_file" "$include_future" "$regions_file" "$vm_table_file"; then
     log_error "Failed to fetch pricing data"
     return 1
   fi
   
-  local total_vms total_pricing
-  total_vms=$(count_lines "$vm_table_file")
+  local total_pricing
   total_pricing=$(count_lines "$pricing_file")
-  log_info "Total across all European regions: $total_vms unique VMs, $total_pricing pricing entries"
+  log_info "Total: $total_vms unique VMs, $total_pricing pricing entries"
   
-  echo "$vm_regions_file"
+  echo "${vm_table_file}.regions"
   return 0
 }
 
