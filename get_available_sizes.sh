@@ -9,7 +9,7 @@ set -euo pipefail
 ################################################################################
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly AZURE_CLI_TIMEOUT=600
+readonly AZURE_CLI_TIMEOUT=1800
 readonly API_TIMEOUT=60
 readonly MAX_API_PAGES=500
 readonly HOURS_PER_MONTH=730
