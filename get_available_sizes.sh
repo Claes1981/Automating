@@ -74,7 +74,7 @@ declare -a TEMP_FILES=()
 ################################################################################
 declare -A IMAGE_MAPPINGS=(
   ["Ubuntu2404"]="Canonical:ubuntu-24_04-lts:server"
-  ["Ubuntu2204"]="Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2"
+  ["Ubuntu2204"]="Canonical:ubuntu-22_04-lts:server"
   ["WindowsServer"]="MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2"
   ["RHEL"]="RedHat:RHEL:8-lvm-gen2"
   ["Debian"]="Debian:debian-11:11-backports-gen2"
@@ -327,7 +327,8 @@ parse_vm_skus_to_table() {
     | (.capabilities // []) as $caps
     | ($caps | map(select(.name == "vCPUs")) | .[0].value // "0") as $vcpus
     | ($caps | map(select(.name == "MemoryGB")) | .[0].value // "0") as $ram
-    | "\($sku)\t\($vcpus)\t\($ram)"
+    | ($caps | map(select(.name == "CpuArchitectureType")) | .[0].value // "x64") as $arch
+    | "\($sku)\t\($vcpus)\t\($ram)\t\($arch)"
   ' "$json_file" > "$output_file"
 }
 
@@ -350,11 +351,12 @@ parse_vm_skus_european_regions() {
     | (.capabilities // []) as $caps
     | ($caps | map(select(.name == "vCPUs")) | .[0].value // "0") as $vcpus
     | ($caps | map(select(.name == "MemoryGB")) | .[0].value // "0") as $ram
+    | ($caps | map(select(.name == "CpuArchitectureType")) | .[0].value // "x64") as $arch
     | $europe_locs[] as $loc
-    | "\($sku)\t\($vcpus)\t\($ram)\t\($loc)"
+    | "\($sku)\t\($vcpus)\t\($ram)\t\($arch)\t\($loc)"
   ' "$json_file" > "$vm_regions_output"
   
-  cut -f1-3 "$vm_regions_output" | sort -u > "$output_file"
+  cut -f1-4 "$vm_regions_output" | sort -u > "$output_file"
 }
 
 count_lines() {
@@ -400,8 +402,29 @@ resolve_image_mapping() {
   # Check Ubuntu versions dynamically
   if [[ "$image_filter" == Ubuntu* ]]; then
     _publisher_ref="Canonical"
-    _offer_ref="UbuntuServer"
-    _sku_ref="${image_filter#Ubuntu}"
+    local version_str="${image_filter#Ubuntu}"
+    version_str="${version_str// /_}"
+    version_str="${version_str//LTS/lts}"
+    version_str=$(echo "$version_str" | tr '[:upper:]' '[:lower:]')
+    
+    case "$version_str" in
+      *24.04*|*24_04*)
+        _offer_ref="ubuntu-24_04-lts"
+        _sku_ref="server"
+        ;;
+      *22.04*|*22_04*)
+        _offer_ref="ubuntu-22_04-lts"
+        _sku_ref="server"
+        ;;
+      *20.04*|*20_04*)
+        _offer_ref="ubuntu-20_04-lts"
+        _sku_ref="server"
+        ;;
+      *)
+        _offer_ref="UbuntuServer"
+        _sku_ref="$version_str"
+        ;;
+    esac
     return 0
   fi
   
@@ -419,14 +442,14 @@ fetch_image_versions() {
   
   log_debug "Fetching image versions for $publisher/$offer:$sku..."
   
-  if ! timeout "$AZURE_CLI_TIMEOUT" az vm image list \
-      --publisher "$publisher" \
-      --offer "$offer" \
-      --sku "$sku" \
-      --location "$location" \
-      --all \
-      -o json > "$output_file" 2>&1; then
-    log_error "Failed to fetch image versions for $publisher/$offer:$sku"
+if ! timeout "$AZURE_CLI_TIMEOUT" az vm image list \
+       --publisher "$publisher" \
+       --offer "$offer" \
+       --sku "$sku" \
+       --location "$location" \
+       --all \
+       -o json > "$output_file" 2>&1; then
+    log_debug "Failed to fetch image versions for $publisher/$offer:$sku in $location"
     return 1
   fi
   
@@ -487,9 +510,9 @@ filter_vms_by_architecture() {
   local output_file="$3"
   
   if [[ "$architecture" == "ARM64" || "$architecture" == "arm64" ]]; then
-    awk -F '\t' 'tolower($1) ~ /arm64/' "$vm_data_file" > "$output_file"
+    awk -F '\t' 'tolower($4) == "arm64"' "$vm_data_file" > "$output_file"
   else
-    cp "$vm_data_file" "$output_file"
+    awk -F '\t' 'tolower($4) != "arm64"' "$vm_data_file" > "$output_file"
   fi
 }
 
@@ -556,14 +579,15 @@ apply_image_filter() {
   image_info_file=$(create_temp_file "image_info")
   
   if ! fetch_image_versions "$publisher" "$offer" "$sku" "$location" "$versions_file"; then
-    return 1
+    log_info "Image $publisher/$offer:$sku not available in $location - excluding from results"
+    > "$output_file"
+    return 0
   fi
   
   if ! get_accessible_image_version "$publisher" "$offer" "$sku" "$location" \
       "$versions_file" "$image_info_file"; then
-    log_error "Could not access any image version for $publisher/$offer:$sku"
-    log_info "Skipping image-based filtering, showing all VMs"
-    cp "$vm_data_file" "$output_file"
+    log_info "Image $publisher/$offer:$sku not available in $location - excluding from results"
+    > "$output_file"
     return 0
   fi
   
