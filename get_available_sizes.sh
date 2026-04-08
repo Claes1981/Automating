@@ -13,11 +13,14 @@ readonly AZURE_CLI_TIMEOUT=1800
 readonly API_TIMEOUT=60
 readonly MAX_API_PAGES=500
 readonly HOURS_PER_MONTH=730
+readonly MAX_IMAGE_VERSION_ATTEMPTS=5
 readonly PRICING_API_BASE="https://prices.azure.com/api/retail/prices?api-version=2022-08-01"
 readonly VM_RESOURCE_TYPE="virtualMachines"
 readonly SERVICE_NAME="Virtual Machines"
 readonly PRICING_TYPE="Consumption"
 readonly PARALLEL_JOBS=6
+readonly DEFAULT_GLOBAL_SKU_TIMEOUT=1800
+readonly DEFAULT_IMAGE_CHECK_TIMEOUT=1800
 
 declare -A REGION_PROXIMITY=(
   ["swedencentral"]=1
@@ -298,7 +301,7 @@ fetch_vm_skus_all_regions() {
   
   log_info "Fetching all VM SKUs globally from Azure CLI..."
   
-  if ! timeout 300 az vm list-skus \
+  if ! timeout "$DEFAULT_GLOBAL_SKU_TIMEOUT" az vm list-skus \
       --resource-type "$VM_RESOURCE_TYPE" \
       -o json > "$output_file" 2>&1; then
     log_error "Failed to fetch VM SKUs from Azure CLI"
@@ -323,6 +326,7 @@ parse_vm_skus_to_table() {
   jq -r --arg loc "$location" '
     .[]
     | select(.locations[]? | ascii_downcase == ($loc | ascii_downcase))
+    | select((.restrictions // []) | length == 0)
     | .name as $sku
     | (.capabilities // []) as $caps
     | ($caps | map(select(.name == "vCPUs")) | .[0].value // "0") as $vcpus
@@ -348,11 +352,14 @@ parse_vm_skus_european_regions() {
     | .locations // [] as $locs
     | ($locs | map(select((. | ascii_downcase) as $loc_lower | $regions_lower | index($loc_lower)))) as $europe_locs
     | select(($europe_locs | length) > 0)
+    | (.restrictions // []) as $restrictions
+    | ($restrictions | map(.values // []) | flatten | map(ascii_downcase)) as $restricted_locs
     | (.capabilities // []) as $caps
     | ($caps | map(select(.name == "vCPUs")) | .[0].value // "0") as $vcpus
     | ($caps | map(select(.name == "MemoryGB")) | .[0].value // "0") as $ram
     | ($caps | map(select(.name == "CpuArchitectureType")) | .[0].value // "x64") as $arch
     | $europe_locs[] as $loc
+    | select((($loc | ascii_downcase) as $loc_lower | $restricted_locs | index($loc_lower)) == null)
     | "\($sku)\t\($vcpus)\t\($ram)\t\($arch)\t\($loc)"
   ' "$json_file" > "$vm_regions_output"
   
@@ -442,13 +449,13 @@ fetch_image_versions() {
   
   log_debug "Fetching image versions for $publisher/$offer:$sku..."
   
-if ! timeout "$AZURE_CLI_TIMEOUT" az vm image list \
-       --publisher "$publisher" \
-       --offer "$offer" \
-       --sku "$sku" \
-       --location "$location" \
-       --all \
-       -o json > "$output_file" 2>&1; then
+  if ! timeout "$AZURE_CLI_TIMEOUT" az vm image list \
+      --publisher "$publisher" \
+      --offer "$offer" \
+      --sku "$sku" \
+      --location "$location" \
+      --all \
+      -o json > "$output_file" 2>&1; then
     log_debug "Failed to fetch image versions for $publisher/$offer:$sku in $location"
     return 1
   fi
@@ -472,7 +479,6 @@ get_accessible_image_version() {
     return 1
   fi
   
-  local max_attempts=5
   local attempt=0
   local version
   
@@ -480,7 +486,7 @@ get_accessible_image_version() {
   
   while IFS= read -r version; do
     attempt=$((attempt + 1))
-    if [[ $attempt -gt $max_attempts ]]; then
+    if [[ $attempt -gt $MAX_IMAGE_VERSION_ATTEMPTS ]]; then
       break
     fi
     
@@ -497,11 +503,6 @@ get_accessible_image_version() {
   done <<< "$versions"
   
   return 1
-}
-
-get_image_architecture() {
-  local image_info_file="$1"
-  jq -r '.architecture // "x64"' < "$image_info_file"
 }
 
 filter_vms_by_architecture() {
@@ -536,7 +537,7 @@ get_european_regions_with_image() {
     local test_file
     test_file=$(create_temp_file "image_test")
     
-    if timeout 30 az vm image list \
+    if timeout "$DEFAULT_IMAGE_CHECK_TIMEOUT" az vm image list \
         --publisher "$publisher" \
         --offer "$offer" \
         --sku "$sku" \
@@ -758,19 +759,19 @@ fetch_pricing_data() {
     local page_response
     page_response=$(create_temp_file "page_response")
     
-if ! fetch_pricing_page "$next_page" "$page_response"; then
-       log_debug "Failed to fetch pricing page $page_count, skipping..."
-       log_debug "Response: $(head -c 500 "$page_response")"
-       next_page=$(get_next_page_link "$page_response" 2>/dev/null) || next_page=""
-       continue
-     fi
-    
-if ! validate_pricing_response "$page_response"; then
-       log_debug "Invalid response from Pricing API on page $page_count, skipping..."
-       log_debug "Response: $(head -c 500 "$page_response")"
-       next_page=$(get_next_page_link "$page_response")
-       continue
-     fi
+  if ! fetch_pricing_page "$next_page" "$page_response"; then
+    log_debug "Failed to fetch pricing page $page_count, skipping..."
+    log_debug "Response: $(head -c 500 "$page_response")"
+    next_page=$(get_next_page_link "$page_response" 2>/dev/null) || next_page=""
+    continue
+  fi
+  
+  if ! validate_pricing_response "$page_response"; then
+    log_debug "Invalid response from Pricing API on page $page_count, skipping..."
+    log_debug "Response: $(head -c 500 "$page_response")"
+    next_page=$(get_next_page_link "$page_response")
+    continue
+  fi
     
     extract_pricing_data "$page_response" "" "$today" "$include_future" "$output_file" "$europe_regions_file" "$vm_table_file"
     
@@ -834,33 +835,26 @@ format_vm_table_row() {
     vm_regions_file="/dev/null"
   fi
   
-  awk -F '\t' -v price_file="$pricing_data_file" -v regions_file="$vm_regions_file" -v hours="$HOURS_PER_MONTH" -v show_region="$show_region" '
+  # Build proximity string from REGION_PROXIMITY associative array
+  local proximity_str=""
+  for region in "${!REGION_PROXIMITY[@]}"; do
+    proximity_str+="${region}:${REGION_PROXIMITY[$region]} "
+  done
+  
+  awk -F '\t' -v price_file="$pricing_data_file" -v regions_file="$vm_regions_file" -v hours="$HOURS_PER_MONTH" -v show_region="$show_region" -v proximity_str="$proximity_str" '
     BEGIN {
       while ((getline < price_file) > 0) {
         split($0, parts, "\t")
         price[parts[1]] = parts[2]
       }
-      proximity["swedencentral"] = 1
-      proximity["swedensouth"] = 2
-      proximity["northeurope"] = 3
-      proximity["norwayeast"] = 4
-      proximity["norwaywest"] = 5
-      proximity["denmarkeast"] = 6
-      proximity["germanynorth"] = 7
-      proximity["polandcentral"] = 8
-      proximity["finlandcentral"] = 9
-      proximity["germanywestcentral"] = 10
-      proximity["italynorth"] = 11
-      proximity["francecentral"] = 12
-      proximity["francesouth"] = 13
-      proximity["belgiumcentral"] = 14
-      proximity["westeurope"] = 15
-      proximity["uksouth"] = 16
-      proximity["ukwest"] = 17
-      proximity["austriaeast"] = 18
-      proximity["spaincentral"] = 19
-      proximity["switzerlandnorth"] = 20
-      proximity["switzerlandwest"] = 21
+      # Parse proximity string from shell variable
+      n = split(proximity_str, pairs, " ")
+      for (i = 1; i <= n; i++) {
+        split(pairs[i], kv, ":")
+        if (kv[1] != "" && kv[2] != "") {
+          proximity[kv[1]] = kv[2]
+        }
+      }
       while ((getline < regions_file) > 0) {
         split($0, parts, "\t")
         vm = parts[1]
